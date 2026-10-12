@@ -1,28 +1,26 @@
 """
-Explain IQ — FastAPI Video Generation Microservice
-==================================================
-Production-ready asynchronous API microservice.
+Explain IQ — Production Video Generation Microservice
+======================================================
+Cloud-optimized, CI/CD-ready asynchronous video generation worker.
 Orchestrates Gemini storyboarding, Edge-TTS audio + subtitles,
 real stock photo fetching, and MoviePy video assembly.
-Features SQLite persistence, bounded worker concurrency, and temp asset isolation.
+Features dual-mode S3/local storage, Spring Boot webhook integration,
+and bounded worker concurrency.
 """
 
 import asyncio
-import json
 import logging
+import os
 import re
 import shutil
-import urllib.request
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from enum import Enum
 from pathlib import Path
-from typing import Literal, Optional, List
+from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -31,15 +29,19 @@ from config import (
     TEMP_DIR,
     TTS_VOICE,
     MAX_CONCURRENT_JOBS,
+    INTERNAL_API_SECRET,
+    USE_S3,
+    PORT,
 )
 import database
 from llm_service import generate_storyboard
 from slide_service import render_slide
 from media_service import generate_tts, fetch_stock_image
 from assembler import SceneAssets, assemble_final_video
+from s3_service import handle_artifacts
+from webhook_service import dispatch_webhook
 
 # ── Logging Setup ──────────────────────────────────────────────
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s │ %(name)-18s │ %(levelname)-7s │ %(message)s",
@@ -48,12 +50,10 @@ logging.basicConfig(
 logger = logging.getLogger("explain_iq")
 
 # ── Worker Concurrency Limiter ─────────────────────────────────
-
 job_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 
 # ── Subtitle Helper: Merge Scene SRTs ──────────────────────────
-
 def _format_srt_timestamp(seconds: float) -> str:
     """Format seconds into SRT timestamp: HH:MM:SS,mmm"""
     hrs = int(seconds // 3600)
@@ -108,29 +108,7 @@ def merge_scene_srts(scene_data: List[tuple[Path, float]], output_srt_path: Path
     return None
 
 
-# ── Webhook Dispatcher ─────────────────────────────────────────
-
-async def dispatch_webhook(webhook_url: str, payload: dict) -> None:
-    """Post job status callback to external webhook."""
-    def _send():
-        try:
-            req_data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                webhook_url,
-                data=req_data,
-                headers={"Content-Type": "application/json", "User-Agent": "ExplainIQ/1.0"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                logger.info(f"Webhook delivered to {webhook_url} (HTTP {resp.status})")
-        except Exception as e:
-            logger.warning(f"Failed to deliver webhook to {webhook_url}: {e}")
-
-    await asyncio.to_thread(_send)
-
-
-# ── Pydantic Request/Response Models ──────────────────────────
-
+# ── Pydantic Request & Response Models ─────────────────────────
 class GenerateRequest(BaseModel):
     concept: str = Field(
         ...,
@@ -139,34 +117,27 @@ class GenerateRequest(BaseModel):
         max_length=500,
         examples=["Newton's Laws of Motion", "Photosynthesis", "Quantum Computing"],
     )
-    target_audience: str = Field(
-        default="high school students",
+    target_audience: Optional[str] = Field(
+        default="students",
         description="Target viewer audience demographic",
-        examples=["high school students", "college freshmen", "middle school students"],
+        examples=["students", "high school students", "college freshmen"],
     )
-    duration_mode: Literal["quick", "standard", "deep_dive"] = Field(
+    duration_mode: Optional[str] = Field(
         default="standard",
         description="Video depth: 'quick' (~45s), 'standard' (~90s), or 'deep_dive' (~3m)",
     )
     voice: Optional[str] = Field(
-        default=TTS_VOICE,
-        description="Edge TTS voice name (e.g., en-US-AriaNeural, en-US-GuyNeural)",
+        default="en-US-AriaNeural",
+        description="Edge TTS voice name",
     )
-    include_music: bool = Field(
+    include_music: Optional[bool] = Field(
         default=False,
         description="Whether to layer subtle background music under narration",
     )
     webhook_url: Optional[str] = Field(
         default=None,
-        description="Optional HTTP URL to receive POST callback upon job completion or failure",
+        description="Optional custom HTTP webhook URL callback",
     )
-
-
-class GenerateResponse(BaseModel):
-    job_id: str
-    status: str
-    queue_position: int
-    message: str
 
 
 class JobStatusResponse(BaseModel):
@@ -186,11 +157,11 @@ class JobStatusResponse(BaseModel):
 
 
 # ── FastAPI Application Lifecycle ─────────────────────────────
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🎬 Explain IQ Production Microservice starting up")
+    logger.info("🎬 Explain IQ Microservice starting up")
     database.init_db()
+    logger.info(f"   Storage mode: {'AWS S3' if USE_S3 else 'Local Disk'}")
     logger.info(f"   Output directory: {OUTPUT_DIR}")
     logger.info(f"   Temp directory: {TEMP_DIR}")
     logger.info(f"   Max concurrent jobs: {MAX_CONCURRENT_JOBS}")
@@ -206,26 +177,16 @@ async def lifespan(app: FastAPI):
                 p.unlink(missing_ok=True)
             except Exception:
                 pass
-        stray_python = BASE_DIR / "python"
-        if stray_python.is_file() and stray_python.stat().st_size == 0:
-            try:
-                stray_python.unlink(missing_ok=True)
-            except Exception:
-                pass
     except Exception as e:
         logger.warning(f"Startup temp cleanup warning: {e}")
 
     yield
-    logger.info("🛑 Explain IQ shutting down")
+    logger.info("🛑 Explain IQ Microservice shutting down")
 
 
 app = FastAPI(
-    title="Explain IQ Video Generation API",
-    description=(
-        "Production-ready video generation microservice. "
-        "Transforms educational concepts into 1080p explainer videos with Gemini storyboarding, "
-        "Edge-TTS speech, real stock photography, and MoviePy assembly."
-    ),
+    title="Explain IQ Microservice",
+    description="Cloud-optimized asynchronous video generation microservice serving StudyGen.",
     version="1.2.0",
     lifespan=lifespan,
 )
@@ -239,157 +200,9 @@ app.add_middleware(
 )
 
 
-# ── Endpoints ──────────────────────────────────────────────────
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint reporting active queue, capacity, and storage stats."""
-    active_count = database.get_active_job_count()
-    total_count = database.get_total_job_count()
-    output_files = len(list(OUTPUT_DIR.glob("*.mp4")))
-
-    return {
-        "status": "healthy",
-        "service": "explain_iq",
-        "active_jobs": active_count,
-        "total_jobs": total_count,
-        "concurrency_limit": MAX_CONCURRENT_JOBS,
-        "completed_videos_stored": output_files,
-    }
-
-
-@app.post("/generate", status_code=202, response_model=GenerateResponse)
-async def generate_video(request: GenerateRequest):
-    """
-    Submit a video generation job.
-    Returns immediately with job_id and queue status.
-    """
-    job_id = str(uuid.uuid4())
-
-    # Record job in persistent database
-    database.create_job(job_id, request.concept, request.target_audience)
-    queue_pos = database.get_queue_position(job_id)
-
-    # Dispatch to background task runner with concurrency control
-    asyncio.create_task(
-        run_pipeline_worker(
-            job_id=job_id,
-            concept=request.concept,
-            target_audience=request.target_audience,
-            duration_mode=request.duration_mode,
-            voice=request.voice or TTS_VOICE,
-            include_music=request.include_music,
-            webhook_url=request.webhook_url,
-        )
-    )
-
-    logger.info(f"Job {job_id[:8]} enqueued (position: {queue_pos}) for: '{request.concept}'")
-
-    return GenerateResponse(
-        job_id=job_id,
-        status="queued",
-        queue_position=queue_pos,
-        message=f"Job queued at position {queue_pos}. Poll /status/{job_id} for updates.",
-    )
-
-
-@app.get("/status/{job_id}", response_model=JobStatusResponse)
-async def get_job_status(job_id: str):
-    """Get the current progress and status of a video job."""
-    job = database.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-
-    queue_pos = database.get_queue_position(job_id) if job["status"] == "queued" else None
-
-    return JobStatusResponse(
-        job_id=job["job_id"],
-        concept=job["concept"],
-        target_audience=job["target_audience"],
-        status=job["status"],
-        progress_pct=job["progress_pct"],
-        current_stage=job["current_stage"],
-        queue_position=queue_pos,
-        error=job["error"],
-        video_url=job["video_url"],
-        subtitles_url=job["subtitles_url"],
-        duration_seconds=job["duration_seconds"],
-        created_at=job["created_at"],
-        updated_at=job["updated_at"],
-    )
-
-
-@app.get("/download/{job_id}")
-async def download_video(job_id: str):
-    """Download the completed 1080p MP4 video file."""
-    job = database.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-
-    if job["status"] == "failed":
-        raise HTTPException(status_code=500, detail=f"Job failed: {job['error']}")
-
-    if job["status"] != "completed":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Video not ready. Current status: {job['status']} ({job['progress_pct']}%)",
-        )
-
-    video_path = OUTPUT_DIR / f"{job_id}.mp4"
-    if not video_path.exists():
-        raise HTTPException(status_code=404, detail="Video file not found on disk")
-
-    return FileResponse(
-        path=str(video_path),
-        media_type="video/mp4",
-        filename=f"explain_iq_{job_id[:8]}.mp4",
-    )
-
-
-@app.get("/subtitles/{job_id}")
-async def download_subtitles(job_id: str):
-    """Download the generated .srt subtitles file."""
-    job = database.get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-
-    srt_path = OUTPUT_DIR / f"{job_id}.srt"
-    if not srt_path.exists():
-        raise HTTPException(status_code=404, detail="Subtitles not found for this job")
-
-    return FileResponse(
-        path=str(srt_path),
-        media_type="application/x-subrip",
-        filename=f"explain_iq_{job_id[:8]}.srt",
-    )
-
-
-@app.get("/jobs")
-async def list_recent_jobs(limit: int = Query(20, ge=1, le=100)):
-    """List recent video generation jobs."""
-    return database.list_jobs(limit=limit)
-
-
-# ── Frontend Static Files (Explain IQ Studio) ──────────────────
-frontend_dir = Path(__file__).parent / "frontend"
-if frontend_dir.exists():
-    app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
-
-
-
 # ── Pipeline Worker with Concurrency Semaphore ────────────────
-
-async def run_pipeline_worker(
-    job_id: str,
-    concept: str,
-    target_audience: str,
-    duration_mode: str,
-    voice: str,
-    include_music: bool,
-    webhook_url: Optional[str] = None,
-) -> None:
-    """Wrapper that enforces the concurrency semaphore and drives the pipeline."""
-    # Update status to waiting if workers are busy
+async def run_pipeline_worker(job_id: str, req: GenerateRequest) -> None:
+    """Orchestrates storyboarding, synthesis, assembly, artifact upload, and webhooks."""
     q_pos = database.get_queue_position(job_id)
     if q_pos > 1:
         database.update_job(
@@ -402,7 +215,7 @@ async def run_pipeline_worker(
         job_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # ── Stage 1: Storyboard ────────────────────────────
+            # ── 1. Storyboarding via Gemini ────────────────────
             database.update_job(
                 job_id,
                 status="storyboarding",
@@ -411,9 +224,9 @@ async def run_pipeline_worker(
             )
 
             storyboard = await generate_storyboard(
-                concept=concept,
-                target_audience=target_audience,
-                duration_mode=duration_mode,
+                concept=req.concept,
+                target_audience=req.target_audience or "students",
+                duration_mode=req.duration_mode or "standard",
             )
             num_scenes = len(storyboard.scenes)
             logger.info(f"[{job_id[:8]}] Storyboard ready: '{storyboard.title}' ({num_scenes} scenes)")
@@ -424,7 +237,7 @@ async def run_pipeline_worker(
                 current_stage=f"Storyboard ready: {num_scenes} scenes",
             )
 
-            # ── Stage 2: Audio & Subtitle Synthesis ───────────
+            # ── 2. TTS Voiceover & Subtitles ──────────────────
             database.update_job(
                 job_id,
                 status="generating_audio",
@@ -437,6 +250,8 @@ async def run_pipeline_worker(
             scene_durations: dict[int, float] = {}
             scene_srt_entries: list[tuple[Path, float]] = []
 
+            selected_voice = req.voice or TTS_VOICE
+
             for i, scene in enumerate(storyboard.scenes):
                 audio_path = audio_dir / f"scene_{scene.scene_id}.mp3"
                 srt_path = audio_dir / f"scene_{scene.scene_id}.srt"
@@ -444,7 +259,7 @@ async def run_pipeline_worker(
                 _, duration = await generate_tts(
                     text=scene.narration_text,
                     output_path=audio_path,
-                    voice=voice,
+                    voice=selected_voice,
                     srt_output_path=srt_path,
                 )
                 scene_durations[scene.scene_id] = duration
@@ -457,7 +272,7 @@ async def run_pipeline_worker(
                     current_stage=f"Voiceover: scene {i + 1}/{num_scenes} ({duration:.1f}s)",
                 )
 
-            # ── Stage 3: Visual Generation ────────────────────
+            # ── 3. Visuals via Pillow & Stock Images ──────────
             database.update_job(
                 job_id,
                 status="generating_visuals",
@@ -502,9 +317,8 @@ async def run_pipeline_worker(
                         scene.scene_id,
                     )
                 else:
-                    # Real stock image fetching
                     image_path = images_dir / f"scene_{scene.scene_id}.png"
-                    query = scene.image_metadata.search_query if scene.image_metadata else concept
+                    query = scene.image_metadata.search_query if scene.image_metadata else req.concept
                     alt = scene.image_metadata.alt_text if scene.image_metadata else f"Scene {scene.scene_id}"
 
                     visual_path = await fetch_stock_image(
@@ -530,7 +344,7 @@ async def run_pipeline_worker(
                     current_stage=f"Visuals: scene {i + 1}/{num_scenes} ({scene.visual_type})",
                 )
 
-            # ── Stage 4: Video Assembly ───────────────────────
+            # ── 4. Assembly & Ken Burns via MoviePy ────────────
             database.update_job(
                 job_id,
                 status="assembling",
@@ -538,83 +352,217 @@ async def run_pipeline_worker(
                 current_stage="Assembling video with Ken Burns motion & transitions...",
             )
 
-            output_video_path = OUTPUT_DIR / f"{job_id}.mp4"
+            local_video_path = OUTPUT_DIR / f"{job_id}.mp4"
 
             await asyncio.to_thread(
                 assemble_final_video,
                 scene_assets,
-                output_video_path,
-                include_music=include_music,
+                local_video_path,
+                include_music=bool(req.include_music),
                 enable_motion=True,
             )
 
-            # Assemble merged SRT subtitles
-            output_srt_path = OUTPUT_DIR / f"{job_id}.srt"
-            merged_srt = merge_scene_srts(scene_srt_entries, output_srt_path)
-            subtitles_url = f"/subtitles/{job_id}" if merged_srt else None
-
+            # Subtitle merge
+            local_srt_path = OUTPUT_DIR / f"{job_id}.srt"
+            merged_srt = merge_scene_srts(scene_srt_entries, local_srt_path)
             total_duration = sum(scene_durations.values())
 
-            # ── Complete ──────────────────────────────────────
+            # ── 5. Artifact Upload & Scratch Disk Purge ───────
+            urls = handle_artifacts(job_id, local_video_path, local_srt_path if merged_srt else None)
+            video_url = urls.get("video_url")
+            subtitles_url = urls.get("subtitles_url")
+
+            # ── 6. Update Database State ──────────────────────
             database.update_job(
                 job_id,
                 status="completed",
                 progress_pct=100,
                 current_stage="Video generation complete!",
-                video_url=f"/download/{job_id}",
+                video_url=video_url,
                 subtitles_url=subtitles_url,
                 duration_seconds=round(total_duration, 1),
             )
 
-            logger.info(f"[{job_id[:8]}] ✅ Video generation completed: {output_video_path}")
+            logger.info(f"[{job_id[:8]}] ✅ Video completed successfully: {video_url}")
 
-            # Send Webhook if configured
-            if webhook_url:
-                webhook_payload = {
-                    "event": "video.completed",
-                    "job_id": job_id,
-                    "concept": concept,
-                    "status": "completed",
-                    "video_url": f"/download/{job_id}",
-                    "subtitles_url": subtitles_url,
-                    "duration_seconds": round(total_duration, 1),
-                }
-                asyncio.create_task(dispatch_webhook(webhook_url, webhook_payload))
+            # ── 7. Webhook Delivery to Spring Boot ────────────
+            await dispatch_webhook(
+                job_id=job_id,
+                status="COMPLETED",
+                video_url=video_url,
+                subtitles_url=subtitles_url,
+                duration_seconds=round(total_duration, 1),
+                target_url=req.webhook_url,
+            )
 
-        except Exception as e:
-            logger.error(f"[{job_id[:8]}] ❌ Pipeline failed: {e}", exc_info=True)
+        except Exception as exc:
+            error_msg = str(exc)
+            logger.error(f"[{job_id[:8]}] ❌ Pipeline failed: {error_msg}", exc_info=True)
             database.update_job(
                 job_id,
                 status="failed",
                 current_stage="Pipeline failed",
-                error=str(e),
+                error=error_msg,
             )
-            if webhook_url:
-                webhook_payload = {
-                    "event": "video.failed",
-                    "job_id": job_id,
-                    "concept": concept,
-                    "status": "failed",
-                    "error": str(e),
-                }
-                asyncio.create_task(dispatch_webhook(webhook_url, webhook_payload))
+
+            # Webhook failure delivery
+            await dispatch_webhook(
+                job_id=job_id,
+                status="FAILED",
+                error=error_msg,
+                target_url=req.webhook_url,
+            )
 
         finally:
-            # Always clean up temp files
+            # Sweep temporary job scratch folder
             try:
                 shutil.rmtree(job_dir, ignore_errors=True)
-                logger.info(f"[{job_id[:8]}] Temp directory cleaned up")
+                logger.info(f"[{job_id[:8]}] Scratch directory cleared")
             except Exception as e:
                 logger.warning(f"[{job_id[:8]}] Cleanup warning: {e}")
 
 
-# ── Direct Run: python main.py ─────────────────────────────────
+# ── REST API Endpoints ─────────────────────────────────────────
 
+@app.get("/health")
+def health():
+    """Health check endpoint reporting microservice status and capacity."""
+    active_count = database.get_active_job_count()
+    total_count = database.get_total_job_count()
+    return {
+        "status": "ok",
+        "service": "explain_iq",
+        "storage_mode": "s3" if USE_S3 else "local",
+        "active_jobs": active_count,
+        "total_jobs": total_count,
+        "concurrency_limit": MAX_CONCURRENT_JOBS,
+    }
+
+
+@app.post("/generate", status_code=status.HTTP_202_ACCEPTED)
+async def generate_video(
+    req: GenerateRequest,
+    background_tasks: BackgroundTasks,
+    x_internal_secret: Optional[str] = Header(None),
+):
+    """
+    Queue video generation.
+    Supports optional shared-secret enforcement via X-Internal-Secret header.
+    """
+    if x_internal_secret and x_internal_secret != INTERNAL_API_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid internal secret")
+
+    job_id = str(uuid.uuid4())
+    database.create_job(job_id, req.concept, req.target_audience or "students")
+    queue_pos = database.get_queue_position(job_id)
+
+    background_tasks.add_task(run_pipeline_worker, job_id, req)
+    logger.info(f"Job {job_id[:8]} queued for concept: '{req.concept}'")
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "queue_position": queue_pos,
+        "message": f"Job {job_id} queued successfully.",
+    }
+
+
+@app.get("/status/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """Get the current progress and status of a video job."""
+    job = database.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    queue_pos = database.get_queue_position(job_id) if job["status"] == "queued" else None
+
+    return JobStatusResponse(
+        job_id=job["job_id"],
+        concept=job["concept"],
+        target_audience=job["target_audience"],
+        status=job["status"],
+        progress_pct=job["progress_pct"],
+        current_stage=job["current_stage"],
+        queue_position=queue_pos,
+        error=job["error"],
+        video_url=job["video_url"],
+        subtitles_url=job["subtitles_url"],
+        duration_seconds=job["duration_seconds"],
+        created_at=job["created_at"],
+        updated_at=job["updated_at"],
+    )
+
+
+@app.get("/download/{job_id}")
+async def download_video(job_id: str):
+    """Download local video or redirect to S3 asset."""
+    job = database.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    if job["status"] == "failed":
+        raise HTTPException(status_code=500, detail=f"Job failed: {job['error']}")
+
+    if job["status"] != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Video not ready. Current status: {job['status']} ({job['progress_pct']}%)",
+        )
+
+    # If already published to S3, redirect directly
+    if job.get("video_url") and job["video_url"].startswith("http"):
+        return RedirectResponse(url=job["video_url"])
+
+    video_path = OUTPUT_DIR / f"{job_id}.mp4"
+    if not video_path.exists():
+        raise HTTPException(status_code=404, detail="Video file not found on disk")
+
+    return FileResponse(
+        path=str(video_path),
+        media_type="video/mp4",
+        filename=f"explain_iq_{job_id[:8]}.mp4",
+    )
+
+
+@app.get("/subtitles/{job_id}")
+async def download_subtitles(job_id: str):
+    """Download local subtitles or redirect to S3 asset."""
+    job = database.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    if job.get("subtitles_url") and job["subtitles_url"].startswith("http"):
+        return RedirectResponse(url=job["subtitles_url"])
+
+    srt_path = OUTPUT_DIR / f"{job_id}.srt"
+    if not srt_path.exists():
+        raise HTTPException(status_code=404, detail="Subtitles not found for this job")
+
+    return FileResponse(
+        path=str(srt_path),
+        media_type="application/x-subrip",
+        filename=f"explain_iq_{job_id[:8]}.srt",
+    )
+
+
+@app.get("/jobs")
+async def list_recent_jobs(limit: int = Query(20, ge=1, le=100)):
+    """List recent video generation jobs."""
+    return database.list_jobs(limit=limit)
+
+
+# ── Frontend Static Files (Optional Studio UI) ────────────────
+frontend_dir = Path(__file__).parent / "frontend"
+if frontend_dir.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
+
+
+# ── Direct Run ────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "main:app",
-        host="127.0.0.1",
-        port=8000,
+        host="0.0.0.0",
+        port=PORT,
         reload=True,
     )

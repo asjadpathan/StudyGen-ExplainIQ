@@ -272,11 +272,11 @@ def assemble_final_video(
             fps=VIDEO_FPS,
             codec="libx264",
             audio_codec="aac",
-            preset="ultrafast",
+            preset="veryfast",      # Minimizes CPU load compared to "medium"
             temp_audiofile=str(temp_audio_file),
             remove_temp=True,
             logger=None,
-            threads=1,
+            threads=2,              # Clamps threads to protect JVM/Postgres from starvation
             ffmpeg_params=["-pix_fmt", "yuv420p"],
         )
     finally:

@@ -1,0 +1,11 @@
+frontend/
+.git
+.github
+__pycache__
+*.pyc
+*.pyo
+venv/
+output/*
+tmp/*
+jobs.db
+.env
