@@ -1,0 +1,67 @@
+# ============================================================
+# Explain IQ - .gitignore
+# ============================================================
+
+# ── Environment & Secrets ───────────────────────────────────
+# Keep API keys and credentials out of version control
+.env
+.env.*
+!.env.example
+
+# ── Python Cache & Bytecode ─────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# ── Virtual Environments ────────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ── Explain IQ Outputs & Temporary Files ────────────────────
+# Video generations and temporary scene media
+output/
+tmp/
+*TEMP_MPY_*
+*.mp4
+media/
+
+# ── SQLite Database & WAL files ─────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ── Stray files ─────────────────────────────────────────────
+python
+
+
+# ── Logs & Debugging ────────────────────────────────────────
+*.log
+logs/
+
+# ── IDEs & Code Editors ─────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# ── Operating System ────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
